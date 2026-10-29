@@ -19,6 +19,8 @@ const state = {
   jobs: [],
   live: {},
   busy: false,
+  scope: "single",   // single = 只做这一集；playlist = 整条合集
+  limit: 0,          // 合集只处理前 N 集，0 = 全部
 };
 
 const hub = new StreamHub({
@@ -197,12 +199,35 @@ function bindEvents() {
   $("#url-input").addEventListener("input", (e) => {
     state.url = e.target.value.trim();
     state.meta = null;
+    renderScope(null);
     updateSubmitState();
   });
   $("#url-input").addEventListener("keydown", (e) => {
     if (e.key === "Enter") probeUrl();
   });
   $("#btn-probe").addEventListener("click", probeUrl);
+
+  $("#scope").addEventListener("change", (e) => {
+    if (e.target.name === "scope") {
+      state.scope = e.target.value;
+      $("#scope-limit-wrap").hidden = state.scope !== "playlist";
+      // 集数超过单次上限时替用户把上限填好。否则按钮上写着「· 150 集」，
+      // 点下去只会被服务端打回一条错误——白等一轮。填好之后按钮改写成
+      // 「· 100 集」，提交的就是眼前这个数字，所见即所得。
+      const cap = state.meta?.max_batch || 100;
+      const count = state.meta?.count || 0;
+      if (state.scope === "playlist" && count > cap && !state.limit) {
+        $("#scope-limit").value = String(cap);
+        state.limit = cap;
+      }
+      updateSubmitState();
+    }
+  });
+  $("#scope-limit").addEventListener("input", (e) => {
+    const n = parseInt(e.target.value, 10);
+    state.limit = Number.isFinite(n) && n > 0 ? n : 0;
+    updateSubmitState();
+  });
 
   $("#voices").addEventListener("click", (e) => {
     const playBtn = e.target.closest("[data-play]");
@@ -261,6 +286,7 @@ function pickFile(file) {
   state.url = "";
   $("#url-input").value = "";
   state.meta = null;
+  renderScope(null);
   renderSummary({
     kind: "file",
     title: file.name,
@@ -286,9 +312,11 @@ async function probeUrl() {
     if (!meta.ok) {
       toast(meta.error || "解析失败");
       renderSummary({ kind: "url", title: url, error: meta.error });
+      renderScope(null);
     } else {
       state.meta = meta;
       renderSummary({ kind: "url", ...meta });
+      renderScope(meta);
     }
   } catch (e) {
     toast(e.message);
@@ -299,6 +327,57 @@ async function probeUrl() {
   }
 }
 
+/* 合集选择块：只有探测到合集时出现 */
+function renderScope(meta) {
+  const box = $("#scope");
+  if (!meta?.ok || !meta.is_playlist || !meta.count) {
+    box.hidden = true;
+    state.scope = "single";
+    state.limit = 0;
+    $("#scope-limit").value = "";
+    return;
+  }
+
+  box.hidden = false;
+  $("#scope-name").textContent = meta.playlist_title || "未命名合集";
+  $("#scope-count").textContent = `共 ${meta.count} 集`;
+
+  const cur = meta.entries?.find((e) => e.index === meta.current_index);
+  const curDur = cur?.duration || meta.duration || 0;
+  $("#scope-single-meta").textContent = curDur
+    ? `当前这一集 · ${fmtDur(curDur)}`
+    : "当前打开的这一集";
+
+  const total = meta.total_duration || 0;
+  $("#scope-all-meta").textContent = total
+    ? `${meta.count} 集 · 共 ${fmtDur(total)} · 约 ${fmtEta(total * 0.33)}`
+    : `${meta.count} 集 · 逐集依次处理`;
+
+  // 超过服务端单次上限，或集数很多时，提醒分批
+  const cap = meta.max_batch || 100;
+  const tip = $("#scope-tip");
+  const tips = [];
+  if (meta.count > cap) tips.push(`单次最多提交 ${cap} 集，请填「最多处理前 ${cap} 集」分批来`);
+  else if (total > 3 * 3600) tips.push("合集较长，会按集依次处理，可以先去忙别的");
+  tip.textContent = tips.join("；");
+  tip.hidden = tips.length === 0;
+  $("#scope-limit").max = String(cap);
+
+  state.scope = "single";
+  state.limit = 0;
+  $("#scope-limit").value = "";
+  $("#scope-limit-wrap").hidden = true;
+  box.querySelector('input[value="single"]').checked = true;
+}
+
+const fmtEta = (sec) => {
+  if (!sec) return "—";
+  const m = Math.round(sec / 60);
+  if (m < 60) return `${Math.max(m, 1)} 分钟`;
+  const h = Math.floor(m / 60);
+  return `${h} 小时${m % 60 ? ` ${m % 60} 分` : ""}`;
+};
+
 function renderSummary(info) {
   const box = $("#summary");
   const rows = [];
@@ -306,6 +385,7 @@ function renderSummary(info) {
   if (info.duration) rows.push(["时长", fmtDur(info.duration)]);
   if (info.size) rows.push(["体积", fmtSize(info.size)]);
   if (info.uploader) rows.push(["来源", info.uploader]);
+  if (info.is_playlist) rows.push(["合集", info.playlist_title || "是"]);
 
   if (info.duration) {
     const eta = Math.max(20, Math.round(info.duration * 0.33));
@@ -326,15 +406,30 @@ function renderSummary(info) {
   box.hidden = rows.length === 0;
 }
 
+function scopeCount() {
+  const total = state.meta?.count || 0;
+  return state.limit > 0 ? Math.min(state.limit, total) : total;
+}
+
+function submitLabel() {
+  if (state.meta?.is_playlist && state.scope === "playlist") {
+    return `开始配音 · ${scopeCount()} 集`;
+  }
+  return "开始配音";
+}
+
 function updateSubmitState() {
   const ready = Boolean(state.file || state.url);
   const btn = $("#btn-submit");
   btn.disabled = !ready || state.busy;
+  if (!state.busy) btn.textContent = submitLabel();
   $("#submit-hint").textContent = state.busy
     ? "处理中…"
-    : ready
-    ? "准备好就开始"
-    : "先拖入文件或粘贴链接";
+    : !ready
+    ? "先拖入文件或粘贴链接"
+    : state.meta?.is_playlist && state.scope === "playlist"
+    ? `会按顺序处理 ${scopeCount()} 集，队列里可以随时取消`
+    : "准备好就开始";
 }
 
 function collectParams() {
@@ -350,6 +445,19 @@ function collectParams() {
 }
 
 /* ------------------------------------------------------------------ 提交 */
+function resetForm() {
+  state.file = null;
+  state.bgmFile = null;
+  state.url = "";
+  state.meta = null;
+  state.scope = "single";
+  state.limit = 0;
+  $("#url-input").value = "";
+  $("#summary").hidden = true;
+  $("#file-input").value = "";
+  renderScope(null);
+}
+
 function submit() {
   if (state.busy) return;
   const fd = new FormData();
@@ -357,6 +465,10 @@ function submit() {
   else fd.append("url", state.url);
   if (state.meta?.title) fd.append("title", state.meta.title);
   fd.append("params", JSON.stringify(collectParams()));
+  if (state.meta?.is_playlist) {
+    fd.append("scope", state.scope);
+    fd.append("limit", String(state.scope === "playlist" ? state.limit : 0));
+  }
   if (state.bgmFile) fd.append("bgm", state.bgmFile);
 
   state.busy = true;
@@ -377,16 +489,18 @@ function submit() {
     btn.textContent = "开始配音";
     if (xhr.status >= 200 && xhr.status < 300) {
       try {
-        const job = JSON.parse(xhr.responseText);
-        state.file = null;
-        state.bgmFile = null;
-        state.url = "";
-        state.meta = null;
-        $("#url-input").value = "";
-        $("#summary").hidden = true;
-        $("#file-input").value = "";
-        toast("已加入队列");
-        hub.ensure(job.id);
+        const data = JSON.parse(xhr.responseText);
+        resetForm();
+        if (data.jobs?.length) {
+          toast(`已加入队列：${data.count} 集`);
+          // 只给第一集挂进度流：一百集就是一百条 SSE 连接，浏览器扛不住。
+          // 后面的集数靠轮询，轮到谁跑时刷新逻辑会自动给它连上。
+          hub.ensure(data.jobs[0].id);
+        } else {
+          toast("已加入队列");
+          if (data.id) hub.ensure(data.id);
+        }
+        updateSubmitState();
         refreshJobs();
       } catch {
         toast("返回内容异常");
@@ -495,9 +609,15 @@ function renderCard(job) {
 
   const logs = live?.logs || [];
 
+  const pl = job.playlist || {};
+  const ep = pl.index
+    ? `<span class="ep-tag" title="来自合集：${esc(pl.title || "")}">第 ${pl.index} 集</span>`
+    : "";
+
   return `
   <article class="job ${job.state}" data-job="${job.id}">
     <div class="job-top">
+      ${ep}
       <span class="job-title" title="${esc(job.title)}">${esc(job.title)}</span>
       <span class="job-meta">${job.duration ? fmtDur(job.duration) : ""}</span>
       <span class="badge ${job.state}">${

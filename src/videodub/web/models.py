@@ -26,6 +26,14 @@ class ProbeRequest(BaseModel):
     url: str
 
 
+class PlaylistEntry(BaseModel):
+    """合集里的一集（只用于界面预览，下载时服务端自己重新取全量）。"""
+
+    index: int
+    title: str = ""
+    duration: float = 0.0
+
+
 class ProbeResponse(BaseModel):
     ok: bool
     title: str = ""
@@ -33,6 +41,15 @@ class ProbeResponse(BaseModel):
     uploader: str = ""
     thumbnail: str = ""
     error: str = ""
+    # ---- 合集
+    is_playlist: bool = False
+    count: int = 0
+    playlist_title: str = ""
+    current_index: int = 0
+    total_duration: float = 0.0
+    max_batch: int = 0
+    eta_sec: float = 0.0
+    entries: list[PlaylistEntry] = []
 
 
 class PreviewRequest(BaseModel):

@@ -8,15 +8,22 @@
 2. **格式串强制 ``vcodec^=avc1``**
    YouTube 的 4K 是 AV1 编码，很多 Windows 播放器播不了（黑屏或有画无声），
    而且体积大得多。对「换配音」这件事，1080p H.264 是正确取舍。
+
+**合集（播放列表）怎么处理**：``probe_playlist`` 只读列表页（``--flat-playlist``），
+一次拿到全部集数与标题；真正的下载仍然是一集一个任务，靠 ``--playlist-items``
+（或用条目自己的 url）精确取第 N 集。不做「一个任务下完整个列表」——
+那样进度、断点续跑、单集重试全都要重写。
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from ..config import Settings
 from ..errors import DownloadError
@@ -31,6 +38,12 @@ _PCT_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
 _TOTAL_RE = re.compile(r"of\s+~?\s*([\d.]+)\s*(\w+)")
 
 COOKIE_NAMES = ("cookies.txt",)
+
+# 列表页里出现这些标题说明那一集已经不可用，占着集数但没有内容
+_SKIP_TITLES = {"[Private video]", "[Deleted video]", "Private video", "Deleted video"}
+
+# 一次最多列这么多集。再长的列表页交给用户自己填「只处理前 N 集」
+PLAYLIST_ENTRY_CAP = 500
 
 
 def find_cookies(extra_dirs: list[Path] | None = None) -> Path | None:
@@ -57,15 +70,18 @@ def find_cookies(extra_dirs: list[Path] | None = None) -> Path | None:
     return None
 
 
-def _base_cmd() -> list[str]:
-    return [
+def _base_cmd(*, no_playlist: bool = True) -> list[str]:
+    cmd = [
         sys.executable, "-m", "yt_dlp",
         "--ignore-config",          # 防止用户的全局配置干扰我们的参数
         "--newline",                # 进度一行一行来，好解析
         "--no-warnings",
         "--remote-components", "ejs:github",
-        "--no-playlist",            # 默认只下当前这一个，不炸整个播放列表
     ]
+    if no_playlist:
+        # 默认只下当前这一个，不炸整个播放列表
+        cmd.append("--no-playlist")
+    return cmd
 
 
 def _net_args(settings: Settings, cookies: Path | None) -> list[str]:
@@ -103,8 +119,6 @@ def probe_url(url: str, settings: Settings) -> dict:
     cmd = [*_base_cmd(), "--dump-single-json", "--skip-download",
            *_net_args(settings, cookies), url]
     try:
-        import json
-
         p = subprocess.run(  # noqa: S603
             cmd, capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=90,
@@ -129,6 +143,111 @@ def probe_url(url: str, settings: Settings) -> dict:
         return {"ok": False, "title": "", "duration": 0.0, "error": "返回内容无法解析"}
 
 
+def _query_param(url: str, key: str) -> str:
+    try:
+        return (parse_qs(urlparse(url).query).get(key) or [""])[0]
+    except ValueError:
+        return ""
+
+
+def _entry_url(entry: dict) -> str:
+    """列表页里占位条目的直链。
+
+    YouTube 的 flat 条目直接带完整 url；别的站点偶尔只给 id，
+    这时返回空串，调用方回退成「播放列表地址 + 第几集」的方式下载。
+    """
+    url = str(entry.get("url") or entry.get("webpage_url") or "")
+    if url.startswith("http"):
+        return url
+    vid = str(entry.get("id") or "")
+    if vid and "youtube" in str(entry.get("ie_key") or "").lower():
+        return f"https://www.youtube.com/watch?v={vid}"
+    return ""
+
+
+def probe_playlist(url: str, settings: Settings) -> dict:
+    """看这个链接是单个视频还是一个合集，是合集就把每集列出来。
+
+    与 :func:`probe_url` 的关键差别是**不加** ``--no-playlist``：``watch?v=…&list=…``
+    这种链接在 yt-dlp 里默认会被当成整个播放列表，正是我们要的信息。
+    ``--flat-playlist`` 让它只读列表页、不逐个解析视频——实测 150 集约 3 秒，
+    逐个解析会慢到几分钟。
+    """
+    cookies = find_cookies()
+    cmd = [*_base_cmd(no_playlist=False), "--flat-playlist", "-J",
+           "--skip-download", *_net_args(settings, cookies), url]
+    try:
+        p = subprocess.run(  # noqa: S603
+            cmd, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return _pl_fail("yt-dlp 启动失败")
+    if p.returncode != 0:
+        tail = (p.stderr or "").strip().splitlines()
+        return _pl_fail((tail[-1] if tail else "解析失败")[:300])
+    try:
+        data = json.loads(p.stdout or "{}")
+    except (ValueError, TypeError):
+        return _pl_fail("返回内容无法解析")
+    if not isinstance(data, dict):
+        return _pl_fail("返回内容无法解析")
+
+    raw = data.get("entries")
+    is_playlist = data.get("_type") == "playlist" or (
+        isinstance(raw, list) and len(raw) > 1
+    )
+
+    entries: list[dict] = []
+    if isinstance(raw, list):
+        for i, e in enumerate(raw, 1):
+            if not isinstance(e, dict):        # 解析失败的条目会是 None
+                continue
+            title = str(e.get("title") or "").strip()
+            if not title or title in _SKIP_TITLES:
+                continue
+            entries.append({
+                "index": i,                   # 保留在列表里的原始序号
+                "id": str(e.get("id") or ""),
+                "title": title,
+                "duration": float(e.get("duration") or 0.0),
+                "url": _entry_url(e),
+            })
+    capped = entries[:PLAYLIST_ENTRY_CAP]
+
+    # 「单个视频」模式下要处理哪一集：看链接里的 v= 参数
+    current = 1
+    vid = _query_param(url, "v")
+    if vid:
+        for e in capped:
+            if e["id"] == vid:
+                current = e["index"]
+                break
+
+    return {
+        "ok": True,
+        "is_playlist": bool(is_playlist),
+        "id": str(data.get("id") or ""),
+        "title": str(data.get("title") or "").strip(),
+        "count": len(capped),
+        "total": len(entries),
+        "entries": capped,
+        "current_index": current,
+        "duration": float(data.get("duration") or 0.0),
+        "uploader": str(data.get("uploader") or data.get("channel") or ""),
+        "thumbnail": str(data.get("thumbnail") or ""),
+        "error": "",
+    }
+
+
+def _pl_fail(msg: str) -> dict:
+    return {
+        "ok": False, "is_playlist": False, "id": "", "title": "",
+        "count": 0, "total": 0, "entries": [], "current_index": 0,
+        "duration": 0.0, "uploader": "", "thumbnail": "", "error": msg,
+    }
+
+
 def format_selector(max_height: int = 1080) -> str:
     h = int(max_height)
     return (
@@ -143,8 +262,14 @@ def download(
     workdir: Path,
     settings: Settings,
     reporter: Reporter | None = None,
+    *,
+    item: int | None = None,
 ) -> Path:
-    """下载到 ``workdir/source.<ext>``，返回文件路径。"""
+    """下载到 ``workdir/source.<ext>``，返回文件路径。
+
+    ``item`` 给定时表示「从播放列表里只取第 N 集」——此时把 ``--no-playlist``
+    换成 ``--playlist-items N``。一集一个任务，进度条和断点续跑都还是原来的语义。
+    """
     workdir.mkdir(parents=True, exist_ok=True)
     cookies = find_cookies()
     if reporter:
@@ -153,13 +278,17 @@ def download(
             proxy = platforms.current().detect_proxy() or "未检测到"
         reporter.log(f"代理：{proxy}")
         reporter.log(f"登录凭据：{cookies.name if cookies else '无（公开视频通常够用）'}")
+        if item:
+            reporter.log(f"合集第 {item} 集")
 
     tmpl = str(workdir / "source.%(ext)s")
-    cmd = [*_base_cmd(),
+    cmd = [*_base_cmd(no_playlist=item is None),
            "-f", format_selector(settings.max_height),
            "--merge-output-format", "mp4",
-           "-o", tmpl,
-           *_net_args(settings, cookies), url]
+           "-o", tmpl]
+    if item:
+        cmd += ["--playlist-items", str(int(item))]
+    cmd += [*_net_args(settings, cookies), url]
 
     proc = subprocess.Popen(  # noqa: S603
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -234,6 +363,6 @@ def read_source_url(workdir: Path) -> str:
 
 __all__ = [
     "STAGE", "download", "find_cookies", "format_selector", "get_title",
-    "is_remote", "log", "probe_url", "read_source_url", "write_source_url",
-    "os",
+    "is_remote", "log", "probe_playlist", "probe_url", "read_source_url",
+    "write_source_url", "os",
 ]

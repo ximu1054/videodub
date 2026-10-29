@@ -76,6 +76,19 @@ class SerialWorker:
         self.start()
         return position
 
+    def ensure_capacity(self, extra: int) -> None:
+        """给「一次提交整个合集」临时放宽上限。
+
+        默认上限（10）是防误触用的；用户明确点「处理整个合集」时，
+        第 11 集被拒反而是 bug。上限只放宽、不回收——串行队列里
+        多排几十个空任务的开销可以忽略。
+        """
+        with self._lock:
+            # 就地算，**不能**调 self.depth：那是 property，会再抢一次同一把
+            # 非重入锁，直接把请求线程锁死（一次提交整个合集就是永久挂起）。
+            depth = len(self._pending) + (1 if self._current else 0)
+            self.max_queue = max(self.max_queue, depth + max(0, extra))
+
     def cancel(self, job_id: str) -> bool:
         """取消。已经在跑的任务会在阶段边界/下载循环里退出。"""
         with self._lock:

@@ -41,6 +41,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mt-backend", default=None, choices=["auto", "local", "api", "none"])
     p.add_argument("--bgm", default=None, help="伴奏 wav（会做侧链压缩，说话时自动压低）")
     p.add_argument("--height", type=int, default=None, help="下载画质上限，默认 1080")
+    p.add_argument("--playlist", action="store_true",
+                   help="链接是合集时，把整个合集逐集处理（默认只处理当前这一集）")
+    p.add_argument("--limit", type=int, default=0,
+                   help="配合 --playlist：只处理前 N 集（默认全部）")
     p.add_argument("--force", default=None, choices=["download", "asr", "translate", "render"],
                    help="从某个阶段重跑（会清掉该阶段及下游产物）")
     p.add_argument("--open", action="store_true", help="完成后打开所在文件夹")
@@ -97,9 +101,10 @@ def _merge_settings(args) -> Settings:
 
 def cmd_run(args) -> int:
     from .jobs.store import Job
-    from .pipeline import build_source, open_result, run_job
+    from .pipeline import (build_playlist_sources, build_source, open_result,
+                           run_job)
     from .stages.translate import check_ready
-    from . import pipeline
+    from .util import is_url
 
     settings = _merge_settings(args)
     set_quiet(args.quiet)
@@ -115,46 +120,72 @@ def cmd_run(args) -> int:
     if backend != "none" and not args.quiet:
         log(f"翻译后端：{backend}")
 
-    source, _ = build_source(args.target, settings)
-    job = Job.create(source=source, params=settings.to_dict())
-
-    if args.force:
-        job.clear_from(args.force)
-
-    if not args.quiet:
-        banner(f"VideoDub · {source['title'][:60]}")
-        if source.get("duration"):
-            log(f"时长 {hr(source['duration'])}")
-
-    reporter = StdoutReporter(job_id=job.id, has_download=source.get("kind") == "url",
-                             verbose=not args.quiet)
+    # ---- 解析成「一集一个 source」的列表
+    multi = False
+    if getattr(args, "playlist", False) and is_url(args.target):
+        sources, info = build_playlist_sources(args.target, settings,
+                                               limit=getattr(args, "limit", 0))
+        multi = True
+        if not args.quiet:
+            log(f"合集《{info.get('title', '')}》共 {info.get('total')} 集，"
+                f"本次处理 {len(sources)} 集")
+    else:
+        source, _ = build_source(args.target, settings)
+        sources = [source]
 
     bgm = Path(args.bgm).expanduser().resolve() if args.bgm else None
-    try:
-        result = run_job(job, settings, reporter, bgm=bgm)
-    except VideoDubError:
-        return 1
+    finished: list[dict] = []
+    failed = 0
 
-    if args.json:
-        print(json.dumps({
-            "job_id": job.id, "state": job.state,
+    for idx, source in enumerate(sources, 1):
+        job = Job.create(source=source, params=settings.to_dict())
+        if args.force:
+            job.clear_from(args.force)
+
+        if not args.quiet:
+            if multi:
+                banner(f"VideoDub · [{idx}/{len(sources)}] {source['title'][:50]}")
+            else:
+                banner(f"VideoDub · {source['title'][:60]}")
+            if source.get("duration"):
+                log(f"时长 {hr(source['duration'])}")
+
+        reporter = StdoutReporter(job_id=job.id,
+                                  has_download=source.get("kind") == "url",
+                                  verbose=not args.quiet)
+        try:
+            result = run_job(job, settings, reporter, bgm=bgm)
+        except VideoDubError:
+            failed += 1
+            if not multi:
+                return 1
+            log(f"第 {idx} 集失败，继续下一集", "warn")
+            continue
+
+        finished.append({
+            "job_id": job.id, "state": job.state, "title": source.get("title", ""),
             "video": result.get("video"), "audio": result.get("audio"),
             "report": result.get("report", {}),
-        }, ensure_ascii=False, indent=1))
-    elif not args.quiet:
-        banner("完成")
-        log(f"成片：{result.get('video')}")
-        if audio := result.get("audio"):
-            log(f"音轨：{audio}")
-        report = result.get("report") or {}
-        if report:
-            log(f"铺入 {report.get('placed')} 句 · "
-                f"压缩 {report.get('tempo_compressed')} 句 · "
-                f"最大漂移 {report.get('drift_max')} 秒")
+        })
+        if not args.quiet:
+            log(f"成片：{result.get('video')}")
+            report = result.get("report") or {}
+            if report:
+                log(f"铺入 {report.get('placed')} 句 · "
+                    f"压缩 {report.get('tempo_compressed')} 句 · "
+                    f"最大漂移 {report.get('drift_max')} 秒")
 
-    if args.open:
-        open_result(job, result)
-    return 0
+    if args.json:
+        payload = finished if multi else (finished[0] if finished else {})
+        print(json.dumps(payload, ensure_ascii=False, indent=1))
+    elif multi and not args.quiet:
+        banner("全部完成" if not failed else f"完成 {len(finished)} 集，失败 {failed} 集")
+
+    if args.open and finished:
+        from .jobs.store import Job as _J
+
+        open_result(_J.load(finished[-1]["job_id"]), finished[-1])
+    return 0 if failed == 0 else 1
 
 
 # ---------------------------------------------------------------- serve

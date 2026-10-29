@@ -16,7 +16,10 @@ from __future__ import annotations
 import asyncio
 import json
 import queue
+import shutil
+import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -30,8 +33,9 @@ from ..jobs.store import Job, disk_usage, free_gb, job_dir, list_jobs, validate_
 from ..log import log
 from ..media.ffmpeg import find_ffmpeg, probe
 from ..media.range import range_response
-from ..pipeline import build_source, check_disk, run_job
+from ..pipeline import (build_source, check_disk, run_job, sources_from_playlist)
 from ..progress import BaseReporter
+from ..stages import download as dl
 from ..stages import translate
 from ..stages.asr import MODEL_REPOS, MODEL_SIZES
 from ..stages.tts import cache_key, render_preview
@@ -47,6 +51,14 @@ router = APIRouter()
 MAX_UPLOAD = 4 * 1024 ** 3      # 4GB
 CHUNK = 1024 * 1024
 BGM_EXTS = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus"}
+
+# 一次最多提交这么多集。再多就建议分批——不是技术限制，
+# 而是一百集排进去要跑十几个小时，让用户分段更容易中途调整。
+PLAYLIST_MAX = 100
+
+# 探测结果缓存：预览时解析一次，点「开始」时直接复用，省掉重复的列表页请求
+_PROBE_TTL = 600.0
+_PROBE_CACHE: dict[str, tuple[float, dict]] = {}
 
 
 class AppState:
@@ -153,6 +165,15 @@ def _save_upload(upload: UploadFile, dst: Path) -> int:
     return size
 
 
+def _bgm_suffix(upload: UploadFile) -> str:
+    suffix = Path(upload.filename or "bgm.wav").suffix.lower()
+    if suffix not in BGM_EXTS:
+        raise HTTPException(status_code=400,
+                            detail=f"不支持的伴奏格式 {suffix or '（无扩展名）'}，"
+                                   "支持 " + "、".join(sorted(BGM_EXTS)))
+    return suffix
+
+
 def _attach_bgm(job: Job, upload: UploadFile | None) -> None:
     """把用户提供的伴奏存进任务目录，供 render 阶段混音。
 
@@ -162,15 +183,121 @@ def _attach_bgm(job: Job, upload: UploadFile | None) -> None:
     job.params.pop("bgm_path", None)
     if upload is None:
         return
-    suffix = Path(upload.filename or "bgm.wav").suffix.lower()
-    if suffix not in BGM_EXTS:
-        raise HTTPException(status_code=400,
-                            detail=f"不支持的伴奏格式 {suffix or '（无扩展名）'}，"
-                                   "支持 " + "、".join(sorted(BGM_EXTS)))
+    suffix = _bgm_suffix(upload)
     dst = job.workdir / f"bgm{suffix}"
     _save_upload(upload, dst)
     job.params["bgm_path"] = str(dst)
     log(f"伴奏已保存：{dst.name}（{human_size(dst.stat().st_size)}）")
+
+
+def _attach_bgm_file(job: Job, src: Path, suffix: str) -> None:
+    """合集批量提交时用：伴奏只上传一次，给每个任务复制一份。"""
+    dst = job.workdir / f"bgm{suffix}"
+    shutil.copyfile(src, dst)
+    job.params["bgm_path"] = str(dst)
+
+
+def _playlist_info(url: str, settings, *, refresh: bool = False) -> dict:
+    """带缓存的合集探测，避免预览完再点开始又解析一遍。"""
+    now = time.time()
+    if not refresh:
+        hit = _PROBE_CACHE.get(url)
+        if hit and now - hit[0] < _PROBE_TTL:
+            return hit[1]
+    info = dl.probe_playlist(url, settings)
+    if info.get("ok"):
+        if len(_PROBE_CACHE) > 32:
+            oldest = min(_PROBE_CACHE, key=lambda k: _PROBE_CACHE[k][0])
+            _PROBE_CACHE.pop(oldest, None)
+        _PROBE_CACHE[url] = (now, info)
+    return info
+
+
+def _batch_disk(entries: list[dict]) -> int:
+    """合集的总磁盘估算。
+
+    每个任务跑完都会留下源码和成片（约 2 倍源码体积），同时正在跑的那一集
+    还要额外占一份中间文件。按 1080p H.264 的 4 Mbit/s 折算。
+    """
+    durations = [float(e.get("duration") or 0.0) for e in entries]
+    total = sum(durations)
+    peak = max(durations, default=0.0)
+    per_sec = 0.5 * 1024 ** 2
+    return int((total * 2 + peak * 2) * per_sec) + 300 * 1024 ** 2
+
+
+def _create_playlist_jobs(url: str, settings, limit: int,
+                          bgm: UploadFile | None) -> dict:
+    """合集模式：一集一个任务，全部排进串行队列。"""
+    info = _playlist_info(url, settings)
+    if not info.get("ok"):
+        raise HTTPException(status_code=400,
+                            detail=info.get("error") or "合集解析失败")
+    if not info.get("is_playlist"):
+        raise HTTPException(status_code=400,
+                            detail="这个链接不是合集，直接按单个视频提交就行")
+
+    entries = list(info.get("entries") or [])
+    total = int(info.get("total") or len(entries))
+    if limit and int(limit) > 0:
+        entries = entries[:int(limit)]
+    if not entries:
+        raise HTTPException(status_code=400, detail="合集里没有可下载的集数")
+    if len(entries) > PLAYLIST_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f"一次最多提交 {PLAYLIST_MAX} 集（这个合集有 {total} 集），"
+                   f"先在「最多处理前 N 集」填 {PLAYLIST_MAX}，分批处理")
+
+    check_disk(_batch_disk(entries))
+
+    # 伴奏只上传一次，再复制进每个任务目录（上传流读一次就没了）
+    tmp_bgm: Path | None = None
+    bgm_suffix = ""
+    if bgm is not None:
+        bgm_suffix = _bgm_suffix(bgm)
+        tmp_bgm = Path(tempfile.mkdtemp(prefix="videodub-bgm-")) / f"bgm{bgm_suffix}"
+        try:
+            _save_upload(bgm, tmp_bgm)
+        except HTTPException:
+            shutil.rmtree(tmp_bgm.parent, ignore_errors=True)
+            raise
+
+    sources = sources_from_playlist(info, url, limit=limit)
+    state.worker.ensure_capacity(len(sources))
+
+    created: list[Job] = []
+    try:
+        for src in sources:
+            job = Job.create(source=src, params=settings.to_dict())
+            if tmp_bgm is not None:
+                _attach_bgm_file(job, tmp_bgm, bgm_suffix)
+            job.save()
+            created.append(job)
+            state.submit(job, settings)
+    except (RuntimeError, OSError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"只建好前 {len(created)} 集就停下了：{exc}",
+        ) from exc
+    finally:
+        if tmp_bgm is not None:
+            shutil.rmtree(tmp_bgm.parent, ignore_errors=True)
+
+    log(f"合集入队 {len(created)} 集：{info.get('title', '')[:40]}")
+
+    jobs = []
+    for job in created:
+        summary = job.summary()
+        pos = state.worker.position(job.id)
+        summary["queue_position"] = pos if pos >= 0 else 0
+        summary["eta_sec"] = round(estimate_seconds(job.duration))
+        jobs.append(summary)
+    return {
+        "ok": True, "count": len(jobs), "total": total,
+        "playlist_title": info.get("title", ""),
+        "jobs": jobs,
+    }
 
 
 # ---------------------------------------------------------------- health
@@ -260,6 +387,8 @@ def create_job(
     url: str = Form(""),
     params: str = Form("{}"),
     title: str = Form(""),
+    scope: str = Form("single"),
+    limit: int = Form(0),
     file: UploadFile | None = File(None),
     bgm: UploadFile | None = File(None),
 ) -> dict:
@@ -287,6 +416,10 @@ def create_job(
     except VideoDubError as exc:
         raise HTTPException(status_code=400,
                             detail=f"{exc.message}。{exc.hint or ''}".strip()) from exc
+
+    # ---- 合集：一次建 N 个任务
+    if url and scope == "playlist":
+        return _create_playlist_jobs(url.strip(), settings, limit, bgm)
 
     # ---- 源解析
     if url:
@@ -470,15 +603,61 @@ def _sse(ev: dict[str, Any]) -> str:
 # ---------------------------------------------------------------- 链接探测
 @router.post("/probe")
 def probe_link(req: ProbeRequest) -> dict:
-    from ..stages.download import probe_url
-
-    if not req.url.strip():
+    """读链接的标题、时长；是合集就额外告诉界面「有多少集」。"""
+    url = req.url.strip()
+    if not url:
         raise HTTPException(status_code=400, detail="网址为空")
+
     settings = load_settings()
-    meta = probe_url(req.url.strip(), settings)
-    if meta.get("duration"):
-        meta["eta_sec"] = round(estimate_seconds(meta["duration"]))
-    return meta
+    info = _playlist_info(url, settings)
+    if not info.get("ok"):
+        return {
+            "ok": False, "title": "", "duration": 0.0, "uploader": "",
+            "thumbnail": "", "error": info.get("error") or "解析失败",
+            "is_playlist": False, "count": 0, "current_index": 0,
+            "playlist_title": "", "total_duration": 0.0, "entries": [],
+        }
+
+    entries = info.get("entries") or []
+    is_playlist = bool(info.get("is_playlist"))
+    cur = next(
+        (e for e in entries if e["index"] == info.get("current_index")), None
+    )
+
+    if is_playlist and cur:
+        title = cur["title"]
+        duration = float(cur["duration"] or 0.0)
+    else:
+        title = info.get("title") or ""
+        duration = float(info.get("duration") or 0.0)
+
+    total_duration = (sum(float(e["duration"] or 0.0) for e in entries)
+                      if is_playlist else duration)
+    count = int(info.get("count") or len(entries))
+
+    out = {
+        "ok": True,
+        "title": title,
+        "duration": duration,
+        "uploader": info.get("uploader", ""),
+        "thumbnail": info.get("thumbnail", ""),
+        "error": "",
+        "is_playlist": is_playlist,
+        "count": count,
+        "playlist_title": info.get("title", "") if is_playlist else "",
+        "current_index": int(info.get("current_index") or 0) if is_playlist else 0,
+        "total_duration": round(total_duration, 1),
+        "max_batch": PLAYLIST_MAX,
+        # 前 20 集给界面做个「确实读到了」的佐证，不用整份传
+        "entries": [
+            {"index": e["index"], "title": e["title"],
+             "duration": round(float(e["duration"] or 0.0), 1)}
+            for e in entries[:20]
+        ] if is_playlist else [],
+    }
+    if total_duration:
+        out["eta_sec"] = round(estimate_seconds(total_duration))
+    return out
 
 
 # ---------------------------------------------------------------- 音色

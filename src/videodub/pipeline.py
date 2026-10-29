@@ -64,6 +64,58 @@ def build_source(target: str, settings: Settings) -> tuple[dict, Path | None]:
     }, p
 
 
+def sources_from_playlist(info: dict, url: str, *, limit: int = 0) -> list[dict]:
+    """把探测结果拆成「一集一个 source」。
+
+    刻意不合并成一个任务：拆开之后，进度、断点续跑、失败重跑、单集删除
+    全部沿用现成逻辑，一行都不用改。
+    """
+    entries = list(info.get("entries") or [])
+    if limit and int(limit) > 0:
+        entries = entries[:int(limit)]
+
+    total = int(info.get("total") or len(entries))
+    sources: list[dict] = []
+    for e in entries:
+        src = {
+            "kind": "url",
+            "url": e.get("url") or url,
+            "title": e.get("title") or f"第 {e['index']} 集",
+            "duration": float(e.get("duration") or 0.0),
+            "uploader": info.get("uploader", ""),
+            "thumbnail": info.get("thumbnail", ""),
+            "playable": True,
+            "playlist": {
+                "id": info.get("id", ""),
+                "title": info.get("title", ""),
+                "index": e["index"],
+                "total": total,
+            },
+        }
+        if not e.get("url"):
+            # 没有直链的站点：退回「列表地址 + 第几集」
+            src["playlist_item"] = e["index"]
+        sources.append(src)
+    return sources
+
+
+def build_playlist_sources(url: str, settings: Settings, *, limit: int = 0
+                           ) -> tuple[list[dict], dict]:
+    """探测一个合集链接，返回 ``(每集的 source 列表, 原始探测结果)``。"""
+    info = download.probe_playlist(url, settings)
+    if not info.get("ok"):
+        raise UserInputError(info.get("error") or "合集解析失败")
+    if not info.get("is_playlist"):
+        raise UserInputError("这个链接不是合集",
+                             hint="它只有一个视频，直接点「开始配音」就行")
+    if not info.get("entries"):
+        raise UserInputError(
+            "合集里没有可下载的集数",
+            hint="如果需要登录：用浏览器扩展导出 cookies.txt，放进「下载」文件夹再试",
+        )
+    return sources_from_playlist(info, url, limit=limit), info
+
+
 def resolve_video(job, settings: Settings, reporter: Reporter | None,
                   cancel: threading.Event | None = None) -> Path:
     """拿到本地视频文件；URL 时下载。"""
@@ -83,7 +135,8 @@ def resolve_video(job, settings: Settings, reporter: Reporter | None,
     t0 = time.time()
     if reporter:
         reporter.stage_start("download", "下载视频")
-    video = download.download(src["url"], job.workdir, settings, reporter)
+    video = download.download(src["url"], job.workdir, settings, reporter,
+                              item=src.get("playlist_item") or None)
     download.write_source_url(job.workdir, src["url"])
     if not src.get("duration"):
         try:
@@ -277,7 +330,7 @@ def check_disk(need_bytes: int, path: Path | None = None) -> None:
 
 
 __all__ = [
-    "build_source", "open_result", "run_job", "resolve_video",
-    "run_stage_asr", "run_stage_translate", "run_stage_render",
-    "check_disk", "log",
+    "build_source", "build_playlist_sources", "sources_from_playlist",
+    "open_result", "run_job", "resolve_video", "run_stage_asr",
+    "run_stage_translate", "run_stage_render", "check_disk", "log",
 ]

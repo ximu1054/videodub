@@ -81,6 +81,22 @@ videodub voices                 # 列出音色
 **唯一需要联网的环节是配音合成**——中文语音走微软 Edge 的在线接口，免费、
 不用 key，但要能连上。识别和翻译都可以完全离线。
 
+### 合集（播放列表）
+
+贴一个合集链接，网页上会多出一块选择区：只做当前这一集，还是整条合集逐集做完。
+
+```bash
+videodub run "https://www.youtube.com/playlist?list=xxx" --playlist            # 整条合集
+videodub run "https://www.youtube.com/playlist?list=xxx" --playlist --limit 5  # 只做前 5 集
+```
+
+整条合集不是「一个大任务」，而是**一集一个任务**排进同一条队列。这样进度、
+断点续跑、失败重跑、单集删除全都沿用现成逻辑。一百集就是一百条任务，串行跑，
+关掉网页也不会中断（关掉程序才会）。
+
+单次最多提交 100 集，超了就分批——这是防误触：`watch?v=…&list=…` 这种链接
+很容易手滑把几千集全塞进队列。
+
 ## 配置
 
 改 `videodub.toml`（放在数据目录里，`videodub config` 会告诉你路径）：

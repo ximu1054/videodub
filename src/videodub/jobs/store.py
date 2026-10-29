@@ -78,6 +78,9 @@ class Job:
     result: dict[str, Any] = field(default_factory=dict)
     error: dict[str, Any] | None = None
     queue_position: int = 0
+    # 同一秒内建的多个任务（合集批量提交）靠它保持顺序：
+    # id 尾部的随机 hex 排不出先后，时间戳又只精确到秒
+    seq: float = 0.0
 
     # -------------------------------------------------- 构造
     @classmethod
@@ -92,6 +95,7 @@ class Job:
             source=source,
             params=params,
             stages={name: {"state": "pending", "elapsed": 0.0} for name in STAGES},
+            seq=time.time(),
         )
 
     # -------------------------------------------------- 路径
@@ -231,6 +235,7 @@ class Job:
             "report": self.result.get("report", {}),
             "error": self.error,
             "playable": self.source.get("playable", True),
+            "playlist": self.source.get("playlist") or {},
         }
 
 
@@ -247,6 +252,8 @@ def list_jobs(limit: int = 50) -> list[Job]:
             continue
         if len(out) >= limit:
             break
+    # 目录名只精确到秒，合集批量提交时同一秒会建好几个，靠 seq 还原先后
+    out.sort(key=lambda j: (j.created, j.seq), reverse=True)
     return out
 
 
