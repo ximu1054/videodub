@@ -348,6 +348,31 @@ def hf_env_for_model(repo_id: str, mirror: str = "auto") -> dict[str, str]:
     return env
 
 
+def _hub_dir() -> Path:
+    return Path(os.environ.get("HF_HOME") or (Path.home() / ".cache" / "huggingface")) / "hub"
+
+
+def model_snapshot(repo_id: str) -> Path | None:
+    """返回模型快照的实际目录，没下载过则 None。
+
+    为什么不用 ``HF_HUB_OFFLINE`` 就够了：huggingface_hub 在 **import 时**把
+    ``HF_HUB_OFFLINE`` 读成模块级常量，之后再改环境变量对已经导入的模块无效。
+    只要流程里更早的地方 import 过 hub（比如 LocalTranslator），ASR 这边设的
+    离线开关就成了摆设，模型明明在本地却照样去联网。直接把快照目录喂给
+    faster-whisper / transformers，才是真正不碰网络的做法。
+    """
+    base = _hub_dir() / ("models--" + repo_id.replace("/", "--"))
+    snaps = base / "snapshots"
+    if not snaps.is_dir():
+        return None
+    ref = base / "refs" / "main"
+    if ref.is_file():
+        target = snaps / ref.read_text(encoding="utf-8").strip()
+        if target.is_dir():
+            return target
+    dirs = [p for p in snaps.iterdir() if p.is_dir()]
+    return max(dirs, key=lambda p: p.stat().st_mtime) if dirs else None
+
+
 def model_cached(repo_id: str) -> bool:
-    home = Path(os.environ.get("HF_HOME") or (Path.home() / ".cache" / "huggingface"))
-    return (home / "hub" / ("models--" + repo_id.replace("/", "--"))).exists()
+    return model_snapshot(repo_id) is not None

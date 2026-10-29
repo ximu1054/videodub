@@ -20,7 +20,7 @@ import re
 import time
 from pathlib import Path
 
-from ..config import Settings, hf_env_for_model
+from ..config import Settings, hf_env_for_model, model_cached
 from ..errors import AuthError, MissingDependencyError, NetworkError, VideoDubError
 from ..log import log
 from ..progress import Reporter
@@ -85,7 +85,13 @@ class LocalTranslator:
 
         self.torch = torch
         self.model_name = model_name
-        self.tok = AutoTokenizer.from_pretrained(model_name)
+        # 模型已在本地就绝不碰网络：HF_HUB_OFFLINE 是 import 时读的常量，
+        # 这里再设已经晚了，只有 local_files_only 能真正拦住联网。
+        local_only = model_cached(model_name)
+        try:
+            self.tok = AutoTokenizer.from_pretrained(model_name, local_files_only=local_only)
+        except Exception as exc:  # noqa: BLE001
+            raise self._load_error(exc) from exc
 
         kw: dict = {"low_cpu_mem_usage": True}
         # transformers 5.x 把 torch_dtype 改名成 dtype，旧名会打弃用告警
@@ -102,9 +108,29 @@ class LocalTranslator:
             kw.pop("dtype", None)
             kw.pop("torch_dtype", None)
 
-        self.model = AutoModelForCausalLM.from_pretrained(model_name, **kw)
+        kw["local_files_only"] = local_only
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(model_name, **kw)
+        except Exception as exc:  # noqa: BLE001
+            raise self._load_error(exc) from exc
         self.model.eval()
         self.where = f"本地 {model_name.split('/')[-1]}（{'GPU' if use_cuda else 'CPU'}）"
+
+    @staticmethod
+    def _load_error(exc: Exception) -> Exception:
+        """把「连不上仓库」翻译成看得懂的提示，别让用户对着 httpx 堆栈发呆。"""
+        name = type(exc).__name__.lower()
+        module = type(exc).__module__.split(".", 1)[0]
+        if any(k in name for k in ("proxy", "connect", "timeout", "sslerror", "httperror")) or \
+                module in {"httpx2", "httpx", "httpcore", "httpcore2", "requests", "urllib3"}:
+            return NetworkError(
+                "加载本地翻译模型时连不上 HuggingFace",
+                hint=("模型还没下载完整。检查代理设置，或把 [network] hf_mirror 设成 "
+                      "hf-mirror.com 走国内镜像；也可以 pip install -e \".[local-mt]\" "
+                      "后用 videodub models --mt 预下载。"),
+                detail=f"{type(exc).__name__}: {exc}"[:800],
+            )
+        return exc
 
     def _generate(self, system: str, user: str, max_new: int) -> str:
         msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]

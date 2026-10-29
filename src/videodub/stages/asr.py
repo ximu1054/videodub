@@ -14,8 +14,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from ..config import Settings, hf_env_for_model
-from ..errors import MissingDependencyError, StageError
+from ..config import Settings, hf_env_for_model, model_snapshot
+from ..errors import MissingDependencyError, NetworkError, StageError
 from ..log import log
 from ..media.audio import read_wav_16k
 from ..media.ffmpeg import duration_of, extract_audio_16k, probe
@@ -27,10 +27,43 @@ from .segment import to_sentences
 STAGE = "asr"
 MODEL_REPOS = "Systran/faster-whisper-{model}"
 
+HF_NET_HINT = (
+    "模型还没下载完整，而当前网络连不上 huggingface.co。\n"
+    "三个办法任选：① 检查代理设置（config.toml 的 [network] proxy）；"
+    "② 把 [network] hf_mirror 设成 hf-mirror.com 走国内镜像；"
+    "③ 换个网络后重试。模型只需下载一次，之后完全离线。"
+)
+
 MODEL_SIZES = {
     "tiny": 0.08, "base": 0.15, "small": 0.5,
     "medium": 1.5, "large-v3": 2.9, "large-v3-turbo": 1.6,
 }
+
+
+def _looks_like_network_error(exc: Exception) -> bool:
+    """判断异常是不是「连不上模型仓库」。
+
+    这类错误千万不能当成「GPU 不可用」去降级——降级之后 CPU 一样连不上，
+    用户最后看到的是「未预期的错误」，真正的原因（代理/镜像）被埋掉了。
+    """
+    name = type(exc).__name__.lower()
+    if any(k in name for k in ("proxy", "connect", "timeout", "sslerror", "httperror")):
+        return True
+    module = type(exc).__module__.split(".", 1)[0]
+    if module in {"httpx2", "httpx", "httpcore", "httpcore2", "requests", "urllib3", "urllib"}:
+        return True
+    text = str(exc).lower()
+    return (
+        "cannot find the requested files in the cached path" in text
+        or "offline mode is enabled" in text
+        or "connection error" in text
+    )
+
+
+def _model_target(model_name: str) -> str:
+    """优先用本地快照目录，避免 huggingface_hub 去网上校验。"""
+    snap = model_snapshot(MODEL_REPOS.format(model=model_name))
+    return str(snap) if snap else model_name
 
 
 def _load_model(model_name: str, device: str, reporter: Reporter | None):
@@ -43,12 +76,20 @@ def _load_model(model_name: str, device: str, reporter: Reporter | None):
             detail=str(exc),
         ) from exc
 
+    target = _model_target(model_name)
+
     if device in ("auto", "cuda"):
         added = platforms.current().enable_cuda_dlls()
         try:
-            m = WhisperModel(model_name, device="cuda", compute_type="float16")
+            m = WhisperModel(target, device="cuda", compute_type="float16")
             return m, "cuda", "float16"
         except Exception as exc:  # noqa: BLE001
+            if _looks_like_network_error(exc):
+                raise NetworkError(
+                    "加载识别模型时连不上 HuggingFace",
+                    hint=HF_NET_HINT,
+                    detail=f"{type(exc).__name__}: {exc}"[:800],
+                ) from exc
             if device == "cuda":
                 raise StageError(
                     stage=STAGE,
@@ -64,7 +105,16 @@ def _load_model(model_name: str, device: str, reporter: Reporter | None):
             if added and reporter:
                 reporter.log(f"已尝试挂载 CUDA 运行库：{len(added)} 个目录", "debug")
 
-    return WhisperModel(model_name, device="cpu", compute_type="int8"), "cpu", "int8"
+    try:
+        return WhisperModel(target, device="cpu", compute_type="int8"), "cpu", "int8"
+    except Exception as exc:  # noqa: BLE001
+        if _looks_like_network_error(exc):
+            raise NetworkError(
+                "加载识别模型时连不上 HuggingFace",
+                hint=HF_NET_HINT,
+                detail=f"{type(exc).__name__}: {exc}"[:800],
+            ) from exc
+        raise
 
 
 # CTranslate2 在 Windows 上是**懒加载** DLL 的：``WhisperModel(...)`` 能成功构造，
@@ -168,7 +218,7 @@ def transcribe(
         del model
         from faster_whisper import WhisperModel
 
-        model = WhisperModel(settings.asr_model, device="cpu", compute_type="int8")
+        model = WhisperModel(_model_target(settings.asr_model), device="cpu", compute_type="int8")
         device, compute = "cpu", "int8"
         words, info = _collect(model, audio, settings, reporter, total)
 

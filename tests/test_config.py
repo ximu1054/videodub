@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 
 from videodub.config import (DEFAULTS, Settings, app_home, config_path, data_dir,
-                             load_settings, model_cached, resolve_hf_endpoint,
-                             save_settings)
+                             load_settings, model_cached, model_snapshot,
+                             resolve_hf_endpoint, save_settings)
 
 
 def test_defaults_cover_all_fields():
@@ -114,9 +114,47 @@ def test_resolve_hf_endpoint_modes(monkeypatch):
     assert resolve_hf_endpoint("https://my.mirror/") == "https://my.mirror"
 
 
-def test_model_cached_checks_hub_dir(home, monkeypatch, tmp_path):
+def test_model_cached_requires_snapshot(home, monkeypatch, tmp_path):
+    """只有目录、没有快照 = 没下完。这种情况不能当「已缓存」，否则会切离线后加载失败。"""
     hub = tmp_path / "hf"
     monkeypatch.setenv("HF_HOME", str(hub))
     assert model_cached("org/model") is False
-    (hub / "hub" / "models--org--model").mkdir(parents=True)
+
+    repo = hub / "hub" / "models--org--model"
+    (repo / "blobs").mkdir(parents=True)
+    assert model_cached("org/model") is False
+
+    snap = repo / "snapshots" / "abc123"
+    snap.mkdir(parents=True)
+    assert model_snapshot("org/model") == snap
     assert model_cached("org/model") is True
+    assert model_cached("org/other") is False
+
+
+def test_model_snapshot_follows_refs_main(home, monkeypatch, tmp_path):
+    hub = tmp_path / "hf"
+    monkeypatch.setenv("HF_HOME", str(hub))
+    repo = hub / "hub" / "models--org--model"
+    old = repo / "snapshots" / "old"
+    new = repo / "snapshots" / "new"
+    old.mkdir(parents=True)
+    new.mkdir(parents=True)
+    (repo / "refs").mkdir()
+    (repo / "refs" / "main").write_text("old\n", encoding="utf-8")
+    assert model_snapshot("org/model") == old
+
+
+def test_model_snapshot_falls_back_to_newest(home, monkeypatch, tmp_path):
+    """没有 refs/main（老版本 hub 或手工拷贝）时，取最新的那个快照。"""
+    import os
+    import time
+
+    hub = tmp_path / "hf"
+    monkeypatch.setenv("HF_HOME", str(hub))
+    snaps = hub / "hub" / "models--org--model" / "snapshots"
+    old = snaps / "old"
+    new = snaps / "new"
+    old.mkdir(parents=True)
+    new.mkdir(parents=True)
+    os.utime(old, (time.time() - 3600, time.time() - 3600))
+    assert model_snapshot("org/model") == new

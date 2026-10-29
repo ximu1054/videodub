@@ -34,6 +34,11 @@
 - 音频装进 MP4 用 Opus 导致声画错位 → 改 AAC 48kHz 立体声
 - 数据轨未剥离导致部分播放器异常 → `-dn`
 - 中文系统下 UTF-8 模式导致批处理乱码 → 脚本改 UTF-8 + `chcp 65001`
+- **模型已缓存却仍去联网**：`HF_HUB_OFFLINE` 是 huggingface_hub 在 import 时读的
+  常量，流程里只要更早 import 过 hub，后面设的离线开关就是摆设。表现为断网时
+  明明本地有模型却报「GPU 不可用」，再退 CPU 也照样失败。改为直接把本地快照
+  目录喂给加载器 / 传 `local_files_only=True`，并把网络错误单独识别成
+  `NetworkError`，不再误报成显卡问题
 
 ### 变更
 

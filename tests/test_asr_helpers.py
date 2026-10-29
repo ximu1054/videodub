@@ -8,8 +8,41 @@ CUDA 缺 DLL 这个坑值得单独测：报错发生在**推理时**而不是加
 from __future__ import annotations
 
 from videodub.stages.asr import (CUDA_DLL_HINT, MODEL_SIZES,
-                                 _looks_like_cuda_dll_error, load_transcript,
+                                 _looks_like_cuda_dll_error,
+                                 _looks_like_network_error, load_transcript,
                                  model_cached)
+
+
+class _ProxyError(Exception):
+    pass
+
+
+class _RateLimit(Exception):
+    pass
+
+
+def test_network_error_recognised_by_name():
+    """ProxyError 不能当成显卡问题——否则会先退回 CPU，然后在同一处再失败一次。"""
+    assert _looks_like_network_error(_ProxyError("502 Bad Gateway")) is True
+
+
+def test_network_error_recognised_by_module():
+    exc = _RateLimit("boom")
+    exc.__class__.__module__ = "httpx2._client"
+    assert _looks_like_network_error(exc) is True
+
+
+def test_network_error_message_marker():
+    exc = ValueError("Cannot find the requested files in the cached path and outgoing "
+                     "traffic was disabled, so we cannot find the file locally.")
+    assert _looks_like_network_error(exc) is True
+
+
+def test_real_gpu_errors_are_not_network_errors():
+    assert _looks_like_network_error(
+        RuntimeError("Library cublas64_12.dll is not found or cannot be loaded")
+    ) is False
+    assert _looks_like_network_error(ValueError("bad shape")) is False
 
 
 def test_recognises_cublas_error():
