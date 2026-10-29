@@ -236,6 +236,36 @@ def _playlist_info(url: str, settings, *, refresh: bool = False) -> dict:
     return info
 
 
+# 开工前体检的结果短暂缓存：连点两次「开始配音」不该重跑一遍十几秒的探测
+_PREFLIGHT_TTL = 120.0
+_PREFLIGHT: tuple[float, dict] | None = None
+
+
+@router.post("/preflight")
+def preflight() -> dict:
+    """开工前问一句：现在这台机器到底能不能下载。
+
+    「整个合集」一提交就是几十上百个任务。节点 IP 被拦或者 cookies 没登录时，
+    它们会一模一样地全部失败，用户得看完整屏红色才知道是同一个原因。
+    这里先花十几秒试一次，不能下载就别让人白排。
+    """
+    from ..stages.download import probe_access
+
+    global _PREFLIGHT
+    now = time.time()
+    if _PREFLIGHT and now - _PREFLIGHT[0] < _PREFLIGHT_TTL:
+        return _PREFLIGHT[1]
+    result = probe_access(load_settings())
+    if result.get("ok"):
+        # 只缓存「通过」。失败时用户多半正要去改 cookies 或换节点，
+        # 缓存下来会让他改完立刻重试仍然被告知同样的错——比不缓存更糟。
+        _PREFLIGHT = (now, result)
+    else:
+        _PREFLIGHT = None
+        log(f"开工前体检未通过：{result.get('message', '')}")
+    return result
+
+
 def _batch_disk(entries: list[dict]) -> int:
     """合集的总磁盘估算。
 

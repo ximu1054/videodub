@@ -96,8 +96,55 @@ def find_port(start: int, attempts: int = 20) -> int:
     raise RuntimeError(f"{start}–{start + attempts} 之间没有可用端口")
 
 
+def running_instance(port: int, *, timeout: float = 2.0) -> dict | None:
+    """看看 ``127.0.0.1:port`` 上是不是已经有一个 VideoDub 在跑。
+
+    有的话就把它的 ``/api/health`` 拿来用；不是我们（或没起来）就返回 None。
+
+    为什么要问：``find_port`` 在端口被占时会顺延到 8766、8767 再起一个新的。
+    用户双击两三次就会有三份进程，界面上看不出区别，改完代码后更是
+    「明明更新了，看到的还是旧的样子」——因为打开的那个标签页连的是旧进程。
+    """
+    import json
+    import urllib.error
+    import urllib.request
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(f"http://127.0.0.1:{port}/api/health", timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except (OSError, ValueError, urllib.error.URLError):
+        return None
+    # 端口上跑的可能是别的东西，认一下身份
+    if not isinstance(data, dict) or "version" not in data:
+        return None
+    return data
+
+
 def serve(settings: Settings, open_browser: bool = True) -> int:
     import uvicorn
+
+    # 已经有一个在跑就别再起一个：多开的每一份都是独立的队列与日志，
+    # 用户只会在两个界面之间反复刷新，最后分不清看的是哪一个。
+    existing = running_instance(settings.port)
+    if existing is not None:
+        stale = existing.get("code_stale")
+        if stale:
+            print()
+            print("  已经有一个 VideoDub 在运行，但它比代码旧，新功能不会出现。")
+            print("  请先关掉任务栏里那个最小化的窗口，再双击本图标。")
+            print()
+        else:
+            print()
+            print(f"  VideoDub 已在运行：http://127.0.0.1:{settings.port}")
+            print("  直接打开它就好（不用重复启动）。")
+            print()
+        if open_browser:
+            try:
+                webbrowser.open(f"http://127.0.0.1:{settings.port}")
+            except Exception:  # noqa: BLE001
+                pass
+        return 0
 
     port = find_port(settings.port)
     strict = settings.host in ("127.0.0.1", "localhost", "")
@@ -133,4 +180,4 @@ def serve(settings: Settings, open_browser: bool = True) -> int:
     return 0
 
 
-__all__ = ["create_app", "find_port", "serve", "STATIC"]
+__all__ = ["create_app", "find_port", "running_instance", "serve", "STATIC"]

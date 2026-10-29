@@ -22,6 +22,7 @@ import os
 import re
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -47,10 +48,15 @@ PLAYLIST_ENTRY_CAP = 500
 
 
 def find_cookies(extra_dirs: list[Path] | None = None) -> Path | None:
-    """按「最可能命中」的顺序找 cookies.txt。
+    """在几个常见位置找 cookies.txt，有多份时取**最新修改**的那一份。
 
-    顺序：yt-dlp 配置目录 → 下载 → 桌面 → 用户指定目录。
+    搜索范围：yt-dlp 配置目录 → 下载 → 桌面 → 用户指定目录。
     要求 >200 字节，避免把误建的空文件当成有效凭据。
+
+    为什么不再「命中第一个就用」：Windows 上 ``%APPDATA%\\yt-dlp`` 排在
+    「下载」**前面**，而扩展默认把文件导出到「下载」。用户照着提示重新
+    导出了一份，程序却还在读 ``%APPDATA%`` 里那份过期的——表现就是
+    「明明换了 cookies，还是被拦」。按修改时间取最新，重新导出就一定生效。
     """
     candidates: list[Path] = []
     candidates.extend(platforms.current().cookies_dirs())
@@ -58,16 +64,176 @@ def find_cookies(extra_dirs: list[Path] | None = None) -> Path | None:
         if d and Path(d).is_dir():
             candidates.append(Path(d))
 
+    found: list[Path] = []
     for d in candidates:
         for name in COOKIE_NAMES:
             p = d / name
             if p.is_file() and p.stat().st_size > 200:
-                return p
+                found.append(p)
         if d.is_dir():
             for p in sorted(d.glob("*cookies*.txt")):
                 if p.is_file() and p.stat().st_size > 200:
-                    return p
+                    found.append(p)
+    if not found:
+        return None
+    # 同一路径可能被上面两个分支重复收进来，按真实路径去重
+    uniq = {p.resolve(): p for p in found}
+    return max(uniq.values(), key=lambda p: p.stat().st_mtime)
+
+
+# 判断「能不能下载」用的固定样本：YouTube 历史上第一个视频（19 秒）。
+# 别用 yt-dlp 自带的测试视频，那个已经下架了，测出来会误报「下载失败」。
+_TEST_VIDEO = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
+
+
+def _proxy_url(settings: Settings) -> str | None:
+    """把配置里的代理解析成能直接用的地址（auto 时探测本机端口）。"""
+    if settings.proxy == "none":
+        return None
+    if settings.proxy and settings.proxy != "auto":
+        return settings.proxy
+    return platforms.current().detect_proxy()
+
+
+def _opener(settings: Settings):
+    proxy = _proxy_url(settings)
+    # 显式传空 dict 会屏蔽环境变量里的代理，免得终端里的 HTTP_PROXY 掺进来
+    handler = urllib.request.ProxyHandler(
+        {"http": proxy, "https": proxy} if proxy else {}
+    )
+    return urllib.request.build_opener(handler)
+
+
+def _cookie_header(path: Path) -> str:
+    """把 Netscape 格式的 cookies.txt 拼成 HTTP 请求头（只要 youtube 的）。"""
+    pairs: list[str] = []
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        f = line.split("\t")
+        if len(f) >= 7 and "youtube" in f[0]:
+            pairs.append(f"{f[5]}={f[6]}")
+    return "; ".join(pairs)
+
+
+def cookies_logged_in(cookies: Path, settings: Settings, *,
+                      timeout: float = 20.0) -> bool | None:
+    """问 YouTube 一句：这份 cookies 到底算不算「已登录」。
+
+    返回 True / False；网络不通返回 None——不知道的时候不要乱下结论。
+
+    为什么不看文件里有没有 ``SID``：``__Secure-3PSID`` 这类 cookie 在
+    **未登录**状态下也会被种上，只按 cookie 名字判断必然误判。让 YouTube
+    自己回答最准——首页 HTML 里的 ``"LOGGED_IN":true|false``。
+    """
+    header = _cookie_header(cookies)
+    if not header:
+        return False
+    req = urllib.request.Request(
+        "https://www.youtube.com/",
+        headers={"Cookie": header, "User-Agent": _UA,
+                 "Accept-Language": "en-US,en;q=0.9"},
+    )
+    try:
+        with _opener(settings).open(req, timeout=timeout) as resp:
+            html = resp.read(4 * 1024 * 1024).decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return None
+    if '"LOGGED_IN":true' in html:
+        return True
+    if '"LOGGED_IN":false' in html:
+        return False
     return None
+
+
+def exit_ip(settings: Settings, *, timeout: float = 8.0) -> str:
+    """当前代理出口的 IP。只为把报错里说不清的地方说明白。"""
+    try:
+        with _opener(settings).open("https://api.ipify.org", timeout=timeout) as r:
+            return r.read(64).decode("ascii", "replace").strip()
+    except (OSError, ValueError):
+        return ""
+
+
+_BOT_MARKERS = ("sign in to confirm", "not a bot")
+
+
+def diagnose(detail: str, cookies: Path | None,
+             settings: Settings) -> tuple[str, str]:
+    """把 yt-dlp 的报错翻成「出了什么事 + 该怎么办」。返回 ``(原因码, 建议)``。
+
+    「要登录才能确认不是机器人」这条最容易被误读，它其实有两种完全不同的
+    成因，修法相反：cookies 里没登录态（该重新导出），或者登录态是好的、
+    被拦的是节点 IP（该换节点）。不区分就只会给一句两头都不对的建议。
+    """
+    lower = detail.lower()
+
+    if any(m in lower for m in _BOT_MARKERS):
+        if cookies is None:
+            return "bot-no-cookies", (
+                "YouTube 要求验证「不是机器人」，而本机没有 cookies。"
+                "在浏览器登录 YouTube，用 Get cookies.txt LOCALLY 导出 cookies.txt，"
+                "放进「下载」文件夹再试")
+        state = cookies_logged_in(cookies, settings)
+        if state is False:
+            return "cookies-not-logged-in", (
+                "cookies.txt 里没有登录态——导出的时候浏览器里没登录 YouTube。"
+                "先打开 youtube.com 确认右上角是自己的头像，再重新导出覆盖；"
+                f"当前读的是 {cookies}")
+        if state is True:
+            ip = exit_ip(settings)
+            where = f"（{ip}）" if ip else ""
+            return "ip-blocked", (
+                f"cookies 的登录态是好的，被拦的是节点出口 IP{where}。"
+                "在代理软件里换一个节点再试，换完跑 videodub doctor 可以复测")
+        return "bot", "YouTube 判定当前节点 IP 像机器人，换一个节点再试（cookies 已带上）"
+
+    if "cookie" in lower:
+        return "cookies", "cookies 已失效或被拒绝，重新导出一次覆盖"
+    if "unsupported url" in lower:
+        return "url", "这个网址 yt-dlp 不支持"
+    if any(m in lower for m in ("private video", "members-only", "join this channel")):
+        return "private", "这一集是私享或会员内容，需要对应账号的 cookies"
+    if any(m in lower for m in ("video unavailable", "video is unavailable",
+                                "has been removed", "no longer available")):
+        return "gone", "这一集已经下架，或当前地区看不到"
+    if any(m in lower for m in ("timed out", "proxy", "connection", "getaddrinfo",
+                                "network is unreachable", "ssl")):
+        return "network", "网络或代理没通，检查节点是否可用、代理端口对不对"
+    return "", ""
+
+
+def probe_access(settings: Settings, *, timeout: float = 60.0) -> dict:
+    """先花十几秒确认「现在到底能不能下载」。
+
+    只做 ``--simulate``：不写盘，只验证能不能拿到格式。给 ``doctor`` 用——
+    与其排了一百集才发现每一集都下载失败，不如先问一次。
+    """
+    cookies = find_cookies()
+    cmd = [*_base_cmd(), "--simulate",
+           *_net_args(settings, cookies), _TEST_VIDEO]
+    try:
+        p = subprocess.run(  # noqa: S603
+            cmd, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {"ok": False, "reason": "error", "message": "yt-dlp 启动失败",
+                "cookies": str(cookies) if cookies else ""}
+    if p.returncode == 0:
+        return {"ok": True, "reason": "ok", "message": "能取到视频信息",
+                "cookies": str(cookies) if cookies else ""}
+    reason, hint = diagnose((p.stderr or "").strip(), cookies, settings)
+    return {"ok": False, "reason": reason or "error",
+            "message": hint or (p.stderr or "").strip()[-300:],
+            "cookies": str(cookies) if cookies else ""}
 
 
 def _base_cmd(*, no_playlist: bool = True) -> list[str]:
@@ -323,15 +489,9 @@ def download(
 
     if proc.returncode != 0:
         detail = (stderr or "\n".join(tail)).strip()[-2500:]
-        lower = detail.lower()
-        hint = ""
-        if "sign in to confirm" in lower or "not a bot" in lower:
-            hint = ("YouTube 判定当前 IP 像机器人。用 Chrome 扩展 Get cookies.txt LOCALLY "
-                    "登录后导出 cookies.txt 放进「下载」文件夹再试；或换一个住宅 IP 节点")
-        elif "cookie" in lower:
-            hint = "cookies 已失效，重新导出一次覆盖"
-        elif "unsupported url" in lower:
-            hint = "这个网址 yt-dlp 不支持"
+        reason, hint = diagnose(detail, cookies, settings)
+        if reason and reporter:
+            reporter.log(f"诊断：{hint}")
         raise DownloadError(f"下载失败（yt-dlp 返回 {proc.returncode}）",
                             hint=hint, detail=detail)
 
@@ -362,7 +522,8 @@ def read_source_url(workdir: Path) -> str:
 
 
 __all__ = [
-    "STAGE", "download", "find_cookies", "format_selector", "get_title",
-    "is_remote", "log", "probe_playlist", "probe_url", "read_source_url",
+    "STAGE", "cookies_logged_in", "diagnose", "download", "exit_ip",
+    "find_cookies", "format_selector", "get_title", "is_remote", "log",
+    "probe_access", "probe_playlist", "probe_url", "read_source_url",
     "write_source_url", "os",
 ]

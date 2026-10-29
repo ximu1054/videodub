@@ -97,6 +97,22 @@ videodub run "https://www.youtube.com/playlist?list=xxx" --playlist --limit 5  #
 单次最多提交 100 集，超了就分批——这是防误触：`watch?v=…&list=…` 这种链接
 很容易手滑把几千集全塞进队列。
 
+点「开始配音」前会先花几秒试一次能不能下载。不行就不建任务，直接在界面上说
+明原因，省得排一百集、看一屏红色才发现是同一个问题。
+
+### 下载被 YouTube 拦了怎么办
+
+报错 `Sign in to confirm you're not a bot` 有两个完全不同的成因，修法相反：
+
+| 成因 | 怎么判断 | 怎么办 |
+|---|---|---|
+| cookies 里没有登录态 | `videodub doctor` 会说「导出时浏览器里没登录」 | 浏览器打开 youtube.com，确认右上角是自己的头像，再用 Get cookies.txt LOCALLY 重新导出，覆盖同一路径 |
+| 登录态正常，节点 IP 被拦 | `videodub doctor` 会说「被拦的是节点出口 IP（x.x.x.x）」 | 在代理软件里换一个节点，再跑一次 `videodub doctor` 复测 |
+
+`videodub doctor` 最后一行会直接给出结论，不用自己猜。程序读的是修改时间最新
+的那份 `cookies.txt`（`%APPDATA%\yt-dlp`、下载、桌面都会找），所以重新导出后
+不必手动删除旧文件。
+
 ## 配置
 
 改 `videodub.toml`（放在数据目录里，`videodub config` 会告诉你路径）：

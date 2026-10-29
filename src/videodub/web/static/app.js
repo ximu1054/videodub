@@ -468,8 +468,41 @@ function resetForm() {
   renderScope(null);
 }
 
-function submit() {
+/* 开工前体检：整个合集一提交就是几十上百个任务，节点被拦时它们会在同一个
+   地方全部失败，用户得看完一屏红色才知道是同一个原因。先花十几秒试一次。 */
+async function preflight() {
+  const tip = $("#scope-tip");
+  state.busy = true;
+  updateSubmitState();
+  $("#btn-submit").textContent = "检查能否下载…";
+  tip.hidden = false;
+  tip.classList.remove("bad");
+  tip.textContent = "正在确认这个节点能不能下载…";
+  try {
+    const r = await api("/api/preflight", { method: "POST" });
+    if (r.ok) {
+      tip.hidden = true;
+      tip.textContent = "";
+      return true;
+    }
+    tip.classList.add("bad");
+    tip.textContent = `现在下载不了，先别排这么多：${r.message}`;
+    return false;
+  } catch (e) {
+    // 体检本身出错不该拦住提交：真有问题时每条任务会各自报清楚
+    tip.hidden = true;
+    return true;
+  } finally {
+    state.busy = false;
+    updateSubmitState();
+  }
+}
+
+async function submit() {
   if (state.busy) return;
+  if (state.meta?.is_playlist && state.scope === "playlist") {
+    if (!(await preflight())) return;
+  }
   const fd = new FormData();
   if (state.file) fd.append("file", state.file);
   else fd.append("url", state.url);

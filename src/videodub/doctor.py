@@ -120,6 +120,31 @@ def _ytdlp() -> Check:
     return Check("yt-dlp", True, getattr(yt_dlp.version, "__version__", "已安装"))
 
 
+def _youtube() -> Check:
+    """真去要一次视频信息，确认「现在这台机器能不能下载」。
+
+    光看 yt-dlp 装没装没用：装好了照样可能被 YouTube 因为节点 IP 拦下来，
+    表现是排了一百集、每一集都下载失败。这一项把那个坑提前暴露出来，
+    换节点之后跑一次 ``videodub doctor`` 就知道好没好。
+    """
+    from .stages.download import probe_access
+
+    settings = load_settings()
+    if settings.proxy == "none":
+        note = "代理已关闭，直连会被拦"
+    else:
+        note = ""
+    r = probe_access(settings)
+    if r["ok"]:
+        return Check("YouTube 下载", True, "能取到视频信息", required=False)
+    detail = r["message"]
+    if note:
+        detail += f"\n       {note}"
+    if r.get("cookies"):
+        detail += f"\n       cookies: {r['cookies']}"
+    return Check("YouTube 下载", False, detail, required=False)
+
+
 def _models() -> Check:
     from .stages.asr import MODEL_REPOS
 
@@ -174,7 +199,7 @@ def _paths() -> Check:
 def run_checks() -> list[Check]:
     return [
         _platform(), _py(), _paths(),
-        _ffmpeg(), _whisper(), _torch(), _tts(), _ytdlp(),
+        _ffmpeg(), _whisper(), _torch(), _tts(), _ytdlp(), _youtube(),
         _models(), _disk(),
     ]
 

@@ -148,3 +148,65 @@ def test_health_reports_stale_code(open_client, monkeypatch):
     monkeypatch.setattr(web_api, "_code_stale", False)
 
     assert open_client.get("/api/health").json()["code_stale"] is True
+
+
+# ---------------------------------------------------------------- 开工前体检
+def test_preflight_passes_through_reason(open_client, monkeypatch):
+    """「能不能下载」的结论要原样带给前端，尤其是缺什么、该改哪里。"""
+    from videodub.stages import download as dl
+    from videodub.web import api as web_api
+
+    monkeypatch.setattr(dl, "probe_access", lambda settings: {
+        "ok": False, "reason": "ip-blocked",
+        "message": "被拦的是节点出口 IP（1.2.3.4）", "cookies": "c.txt",
+    })
+    monkeypatch.setattr(web_api, "_PREFLIGHT", None, raising=False)
+
+    r = open_client.post("/api/preflight")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert body["reason"] == "ip-blocked"
+
+
+def test_preflight_caches_result(open_client, monkeypatch):
+    """连点两次「开始配音」不该重跑一遍十几秒的探测。"""
+    from videodub.stages import download as dl
+    from videodub.web import api as web_api
+
+    calls: list[int] = []
+
+    def fake(settings):
+        calls.append(1)
+        return {"ok": True, "reason": "ok", "message": "", "cookies": ""}
+
+    monkeypatch.setattr(dl, "probe_access", fake)
+    monkeypatch.setattr(web_api, "_PREFLIGHT", None, raising=False)
+
+    open_client.post("/api/preflight")
+    open_client.post("/api/preflight")
+    assert len(calls) == 1
+
+
+def test_preflight_does_not_cache_failure(open_client, monkeypatch):
+    """失败不缓存。
+
+    用户被告知「cookies 没登录」之后，下一步就是去重新导出，回来立刻重试。
+    如果失败也被缓存两分钟，他会以为自己的操作没生效。
+    """
+    from videodub.stages import download as dl
+    from videodub.web import api as web_api
+
+    calls: list[int] = []
+
+    def fake(settings):
+        calls.append(1)
+        return {"ok": False, "reason": "cookies-not-logged-in",
+                "message": "没登录", "cookies": ""}
+
+    monkeypatch.setattr(dl, "probe_access", fake)
+    monkeypatch.setattr(web_api, "_PREFLIGHT", None, raising=False)
+
+    open_client.post("/api/preflight")
+    open_client.post("/api/preflight")
+    assert len(calls) == 2

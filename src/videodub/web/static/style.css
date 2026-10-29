@@ -607,6 +607,14 @@ button:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
   line-height: 1.5;
   color: var(--warn);
 }
+/* 开工前体检失败：这是「按下去必定全失败」的硬错，配色要比提醒更重 */
+.scope-tip.bad {
+  color: var(--err);
+  background: var(--err-soft);
+  border-radius: 8px;
+  padding: 7px 10px;
+  margin-left: 0;
+}
 
 /* ============================ 高级参数 ============================ */
 .advanced { border-top: 1px solid var(--line); padding-top: 14px; }
