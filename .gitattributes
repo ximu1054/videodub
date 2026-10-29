@@ -1,0 +1,17 @@
+# 仓库里统一存 LF。Windows 上检出时按需转换，避免「只在 Windows 上出问题」。
+* text=auto eol=lf
+
+# 批处理必须是 CRLF，否则 cmd.exe 解析会出岔子
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制，别做换行转换
+*.mp4 binary
+*.mp3 binary
+*.wav binary
+*.m4a binary
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary

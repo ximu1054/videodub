@@ -1,0 +1,55 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv venv --python 3.12
+      - run: uv pip install ruff
+      - run: uv run ruff check src tests
+      - run: uv run ruff format --check src tests
+
+  test:
+    # GPU / 联网用例默认不跑：CI 机器既没有显卡，也不该依赖 edge-tts 的可用性
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        python: ["3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv venv --python ${{ matrix.python }}
+      - run: uv pip install -e ".[dev]"
+      - run: uv run pytest -q
+      - name: 冒烟：CLI 能起来
+        run: |
+          uv run videodub --version
+          uv run videodub voices
+
+  windows-install:
+    # Windows 是一等公民，单独验证「全新机器一条命令装完」
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv venv --python 3.12
+      - run: uv pip install -e ".[dev]"
+      - run: uv run python -c "import videodub, videodub.web.app; print(videodub.__version__)"
+      - run: uv run videodub doctor
+        continue-on-error: true

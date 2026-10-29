@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VideoDub · 视频转中文配音</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">◐</span>
+    <div>
+      <h1>VideoDub</h1>
+      <p class="tagline">把英文视频整条换成中文配音</p>
+    </div>
+  </div>
+  <div class="env" id="env">
+    <span class="pill" id="pill-gpu">检测中…</span>
+    <span class="pill" id="pill-ffmpeg">ffmpeg</span>
+    <span class="pill" id="pill-model">模型</span>
+  </div>
+  <div class="queue" id="queue">队列空闲</div>
+</header>
+
+<main class="layout">
+
+  <!-- ==================== 左：新建任务 ==================== -->
+  <aside class="panel">
+    <h2>新建任务</h2>
+
+    <div class="dropzone" id="dropzone" tabindex="0" role="button"
+         aria-label="拖入视频文件或点击选择">
+      <svg viewBox="0 0 24 24" width="30" height="30" aria-hidden="true">
+        <path d="M12 16V4m0 0L8 8m4-4 4 4" fill="none" stroke="currentColor"
+              stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" fill="none"
+              stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+      </svg>
+      <strong>拖入视频文件</strong>
+      <span>或点击选择 · MP4 / MKV / MOV 等</span>
+    </div>
+    <input type="file" id="file-input" accept="video/*,.mkv,.ts" hidden>
+
+    <div class="or"><span>或粘贴链接</span></div>
+
+    <div class="url-row">
+      <input type="url" id="url-input" placeholder="https://www.youtube.com/watch?v=…"
+             autocomplete="off" spellcheck="false">
+      <button id="btn-probe" class="ghost" title="只读取标题，不下载">读取</button>
+    </div>
+
+    <div class="summary" id="summary" hidden></div>
+
+    <details class="advanced" id="advanced">
+      <summary>高级参数</summary>
+
+      <label class="field">
+        <span>识别模型</span>
+        <select id="p-asr">
+          <option value="small">small · 0.5 GB · 最快</option>
+          <option value="medium">medium · 1.5 GB · 平衡</option>
+          <option value="large-v3" selected>large-v3 · 2.9 GB · 质量最好</option>
+        </select>
+      </label>
+
+      <label class="field">
+        <span>翻译引擎</span>
+        <select id="p-mt">
+          <option value="auto" selected>自动（有 API key 就用 API）</option>
+          <option value="local">本地模型（离线，5.8 GB）</option>
+          <option value="api">API（更快更准）</option>
+          <option value="none">不翻译（只转写 + 原文配音）</option>
+        </select>
+      </label>
+
+      <div class="field">
+        <span>音色</span>
+        <div class="voices" id="voices"></div>
+      </div>
+
+      <label class="field">
+        <span>语速 <b id="rate-val">+8%</b></span>
+        <input type="range" id="p-rate" min="-10" max="20" step="2" value="8">
+      </label>
+
+      <label class="field">
+        <span>最大压缩 <b id="tempo-val">1.15×</b></span>
+        <input type="range" id="p-tempo" min="100" max="130" step="5" value="115">
+        <small>越小越自然，代价是偶尔顺延</small>
+      </label>
+
+      <label class="field">
+        <span>起始偏移 <b id="offset-val">0.0s</b></span>
+        <input type="range" id="p-offset" min="-30" max="30" step="1" value="0">
+        <small>整体前移/后移音轨，补偿音画错位</small>
+      </label>
+
+      <label class="field">
+        <span>保留原伴奏</span>
+        <select id="p-bgm">
+          <option value="" selected>关（只有中文人声）</option>
+          <option value="__file__">我提供伴奏文件…</option>
+        </select>
+        <input type="file" id="bgm-input" accept="audio/*,.wav,.mp3" hidden>
+      </label>
+    </details>
+
+    <button id="btn-submit" class="primary" disabled>开始配音</button>
+    <p class="hint" id="submit-hint">先拖入文件或粘贴链接</p>
+  </aside>
+
+  <!-- ==================== 右：任务列表 ==================== -->
+  <section class="jobs">
+    <div class="jobs-head">
+      <h2>任务</h2>
+      <button class="ghost small" id="btn-refresh">刷新</button>
+    </div>
+    <div id="job-list" class="job-list"></div>
+    <div class="empty" id="empty-state">
+      <p>还没有任务。</p>
+      <p class="muted">拖一个英文视频进来，几分钟后就有中文配音版。</p>
+    </div>
+  </section>
+
+</main>
+
+<div class="banner-model" id="model-banner" hidden>
+  <span id="model-banner-text"></span>
+  <button class="ghost small" id="btn-banner-close">知道了</button>
+</div>
+
+<audio id="preview-audio" preload="none"></audio>
+<div class="toast" id="toast" hidden></div>
+
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>

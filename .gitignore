@@ -1,0 +1,64 @@
+# ---- 环境 ----
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ---- 老版本（dub）遗留目录，防止从旧仓库迁移时误提交 ----
+bin/
+in/
+test/
+tmp/
+out/
+out_*/
+scripts/
+data/
+
+# ---- 媒体产物：一律不入库 ----
+*.wav
+*.mp4
+*.mkv
+*.webm
+*.mov
+*.m4a
+*.mp3
+*.flac
+*.srt
+*.vtt
+**/cache/
+
+# ---- 机密与个人配置 ----
+translate_api.json
+videodub.toml
+config.toml
+.env
+.env.*
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 本地试验 ----
+# 我自己跑端到端时用的临时数据目录（含任务产物和一个假翻译接口的配置）
+.e2e/
+.pytest_cache/
+.ruff_cache/
+*.log
+
+# ---- 例外：文档素材要入库 ----
+!docs/assets/*.gif
+!docs/assets/*.png
+!docs/assets/*.jpg
+!docs/assets/*.webp
