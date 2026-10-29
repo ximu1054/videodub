@@ -116,6 +116,8 @@ class HealthResponse(BaseModel):
     voices: list[dict[str, Any]] = []
     config_path: str = ""
     demucs: bool = False
+    # 进程启动后又改过 .py：页面是新的、接口还是旧的，需要重启才生效
+    code_stale: bool = False
 
 
 class StatsResponse(BaseModel):

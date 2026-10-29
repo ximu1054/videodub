@@ -60,6 +60,29 @@ PLAYLIST_MAX = 100
 _PROBE_TTL = 600.0
 _PROBE_CACHE: dict[str, tuple[float, dict]] = {}
 
+# 进程启动时刻。页面上的 css/js 是每次请求从磁盘读的，改完刷新就生效；
+# 但 .py 在启动时已经编译进内存，改完不重启就还是旧的——表现是「界面明明
+# 变了，新功能却不出现」。这里记下启动时间，health 时对比源码 mtime 就能
+# 在页面上直说「需要重启」，省得用户对着一个半新半旧的界面猜。
+_STARTED_AT = time.time()
+_code_stale = False
+
+
+def code_changed() -> bool:
+    """进程启动之后有没有改过源码。只扫 ``*.py``——静态资源不需要重启。"""
+    global _code_stale
+    if _code_stale:
+        return True
+    root = Path(__file__).resolve().parent.parent
+    for p in root.rglob("*.py"):
+        try:
+            if p.stat().st_mtime > _STARTED_AT + 1.0:
+                _code_stale = True
+                return True
+        except OSError:
+            continue
+    return False
+
 
 class AppState:
     """进程内单例：一份 settings + 一个串行 worker。"""
@@ -343,6 +366,7 @@ def health() -> HealthResponse:
         voices=VOICES,
         config_path=str(config_path()),
         demucs=demucs,
+        code_stale=code_changed(),
     )
 
 

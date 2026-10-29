@@ -1108,6 +1108,13 @@ details > summary.hint:hover { color: var(--brand); }
   animation: rise .35s var(--ease) both;
 }
 
+/* 「代码更新了但没重启」——比「要下模型」更急，用警示色分开 */
+.banner-model.stale {
+  border-color: var(--warn);
+  background: var(--warn-soft);
+  color: var(--ink);
+}
+
 .toast {
   position: fixed;
   left: 50%;

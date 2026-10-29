@@ -131,3 +131,20 @@ def test_preview_rejects_traversal(open_client):
 
 def test_job_text_404_without_file(open_client):
     assert open_client.get("/api/jobs/20261029-103700-3f2a/text").status_code == 404
+
+
+# ---------------------------------------------------------------- 鲜度自检
+def test_health_reports_stale_code(open_client, monkeypatch):
+    """源码比进程新时必须报出来。
+
+    页面的 css/js 是每次请求从磁盘读的，所以改完一刷新就变了；但 ``.py`` 在
+    启动时已经编译进内存，不重启就还是旧的。用户看到的就是「界面明明变了，
+    新功能却不出现」。这条让后端自己说出「需要重启」，别让人对着半新半旧的
+    界面猜。
+    """
+    from videodub.web import api as web_api
+
+    monkeypatch.setattr(web_api, "_STARTED_AT", 0.0)   # 假装进程启动于 1970
+    monkeypatch.setattr(web_api, "_code_stale", False)
+
+    assert open_client.get("/api/health").json()["code_stale"] is True

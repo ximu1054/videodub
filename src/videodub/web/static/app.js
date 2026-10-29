@@ -98,10 +98,20 @@ async function loadHealth() {
     renderEnv(h);
     renderVoices(h.voices || []);
     if (h.first_run) showModelBanner(h);
+    // 后端进程比源码旧：页面是新刷的，功能却还是老的。这条比「要下模型」更急，
+    // 直接盖掉它——不说明白的话，用户只会觉得「改了怎么没生效」。
+    if (h.code_stale) showStaleBanner();
   } catch (e) {
     $("#pill-ffmpeg").textContent = "后端未就绪";
     $("#pill-ffmpeg").className = "pill err";
   }
+}
+
+function showStaleBanner() {
+  $("#model-banner-text").textContent =
+    "程序代码已更新，但当前运行的还是旧版本，新功能不会出现。关掉窗口后重新打开即可生效。";
+  $("#model-banner").hidden = false;
+  $("#model-banner").classList.add("stale");
 }
 
 function renderEnv(h) {
